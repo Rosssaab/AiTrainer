@@ -35,11 +35,18 @@ class CryptoPredictor:
         else:
             self.log.info(f"Using existing models directory at {self.model_base_path}")
         
-        # Create SQLAlchemy engine using the connection string from config
-        self.connection_str = (
-            f'mssql+pyodbc:///?odbc_connect={DB_CONNECTION_STRING}'
-        )
-        self.engine = create_engine(self.connection_str)
+        # Use the connection string directly from config
+        try:
+            # Change this part - use DB_CONNECTION_STRING directly
+            self.engine = create_engine(DB_CONNECTION_STRING)
+            
+            # Test connection
+            with self.engine.connect() as conn:
+                self.log.info("Database connection successful")
+        except Exception as e:
+            self.log.error(f"Database connection error: {str(e)}")
+            raise
+
         self.sequence_length = 10
         self.confidence_threshold = 0.7
         
@@ -58,31 +65,43 @@ class CryptoPredictor:
 
     def setup_logging(self):
         """Set up enhanced logging configuration"""
-        log_date = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = f".\\logs\\Crypto_predictor_{log_date}.log"
-        
-        # Create formatter
-        formatter = logging.Formatter(
-            '%(asctime)s - %(levelname)s - %(message)s\n'
-            'Function: %(funcName)s - Line: %(lineno)d\n'
-            '-------------------'
-        )
-        
-        # File handler
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(formatter)
-        
-        # Console handler
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(formatter)
-        
-        # Setup logger
-        self.log = logging.getLogger('CryptoPredictor')
-        self.log.setLevel(logging.DEBUG)
-        self.log.addHandler(file_handler)
-        self.log.addHandler(console_handler)
-        
-        self.log.info(f"Log file created at: {log_file}")
+        try:
+            # Ensure logs directory exists with full path
+            log_dir = os.path.join(os.path.dirname(__file__), 'logs')
+            os.makedirs(log_dir, exist_ok=True)
+            
+            log_date = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file = os.path.join(log_dir, f"Crypto_predictor_{log_date}.log")
+            
+            # Test write permissions
+            with open(log_file, 'a') as f:
+                f.write('')
+            
+            # Create formatter
+            formatter = logging.Formatter(
+                '%(asctime)s - %(levelname)s - %(message)s\n'
+                'Function: %(funcName)s - Line: %(lineno)d\n'
+                '-------------------'
+            )
+            
+            # File handler
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(formatter)
+            
+            # Console handler
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(formatter)
+            
+            # Setup logger
+            self.log = logging.getLogger('CryptoPredictor')
+            self.log.setLevel(logging.DEBUG)
+            self.log.addHandler(file_handler)
+            self.log.addHandler(console_handler)
+            
+            self.log.info(f"Log file created at: {log_file}")
+        except Exception as e:
+            print(f"Error setting up logging: {str(e)}")
+            raise
 
     def get_latest_data(self, crypto_id):
         self.log.debug(f"Fetching latest data for {crypto_id}")
@@ -118,106 +137,71 @@ class CryptoPredictor:
     def prepare_data(self, data):
         self.log.debug("Preparing data for prediction")
         try:
-            base_features = [
-                'current_price',
-                'market_cap',
-                'total_volume',
-                'price_change_24h',
-                'sentiment_votes_up',
-                'sentiment_votes_down',
-                'public_interest_score'
-            ]
-            
-            numeric_data = data[base_features].copy()
-            self.last_current_price = numeric_data['current_price'].iloc[-1]
+            # Get the last current price for later use
+            self.last_current_price = float(data['current_price'].iloc[-1])
             self.log.debug(f"Last current price: {self.last_current_price}")
             
             # Log data statistics
             self.log.debug("\nData Statistics:")
-            self.log.debug(numeric_data.describe().to_string())
+            self.log.debug(data.describe())
             
-            for col in base_features:
-                numeric_data[col] = pd.to_numeric(numeric_data[col], errors='coerce')
-                
-            self.log.debug(f"Data shape before preparation: {numeric_data.shape}")
-            self.log.debug(f"Missing values:\n{numeric_data.isnull().sum()}")
+            # Log data shape and missing values
+            self.log.debug(f"Data shape before preparation: {data.shape}")
+            self.log.debug("Missing values:\n" + str(data.isnull().sum()))
             
-            numeric_data = numeric_data.ffill().bfill()
-            X = numeric_data[base_features].values
-            X = np.nan_to_num(X, nan=0)
+            # Prepare features for prediction
+            features = ['current_price', 'market_cap', 'total_volume', 'price_change_24h',
+                       'sentiment_votes_up', 'sentiment_votes_down', 'public_interest_score']
+            X = data[features].fillna(0).values
             
+            # Scale the data
             scaler = MinMaxScaler()
             X = scaler.fit_transform(X)
             
-            self.log.debug(f"X shape after scaling: {X.shape}")
-            self.log.debug(f"X sample:\n{X[:2]}")
+            # Reshape for LSTM (samples, time steps, features)
+            X = X.reshape(1, X.shape[0], X.shape[1])
             
-            return X.reshape(1, len(numeric_data), len(base_features))
+            self.log.debug(f"X shape after scaling: {X.shape}")
+            self.log.debug(f"X sample:\n{X[0][:2]}")  # Show first two time steps
+            
+            return X
             
         except Exception as e:
             self.log.error(f"Error in prepare_data: {str(e)}")
-            self.log.error(f"Data head:\n{data.head()}")
             raise
 
     def save_prediction(self, crypto_id, predictions, confidence, model_version):
         self.log.debug(f"Saving predictions for {crypto_id}")
         try:
+            # Check for NaN values
+            if np.isnan(predictions).any():
+                self.log.error(f"NaN predictions detected for {crypto_id}")
+                return False
+            
+            # Use last_current_price instead of last_price
+            current_price = float(self.last_current_price)  # Convert to native float
+            
+            # Calculate predicted prices
+            price_24h = float(current_price * (1 + predictions[0][0]))
+            price_48h = float(current_price * (1 + predictions[0][0] * 1.5))
+            price_3d = float(current_price * (1 + predictions[0][0] * 1.75))
+            price_7d = float(current_price * (1 + predictions[0][0] * 2))
+            
+            prediction_data = {
+                'crypto_id': crypto_id,
+                'prediction_date': datetime.now(),
+                'prediction_created_at': datetime.now(),
+                'price_24h': price_24h,
+                'price_48h': price_48h,
+                'price_3d': price_3d,
+                'price_7d': price_7d,
+                'confidence_score': float(confidence),
+                'model_version': model_version,
+                'batch_id': self.batch_id,
+                'current_price': current_price
+            }
+            
             with self.engine.connect() as connection:
-                current_price = self.last_current_price
-                predicted_change = float(predictions[0][0])
-                
-                self.log.debug(f"Current price: {current_price}")
-                self.log.debug(f"Predicted change: {predicted_change}")
-                
-                # New conservative prediction logic
-                max_daily_change = 0.15  # 15% maximum daily change
-                min_daily_change = -0.10  # 10% maximum daily decrease
-                
-                # Clamp the predicted change
-                predicted_change = max(min(predicted_change, max_daily_change), min_daily_change)
-                
-                # Calculate predictions with diminishing returns
-                price_24h = current_price * (1 + predicted_change)
-                price_48h = current_price * (1 + predicted_change * 1.3)  # Reduced from 1.5
-                price_3d = current_price * (1 + predicted_change * 1.5)   # Reduced from 2.0
-                price_7d = current_price * (1 + predicted_change * 2.0)   # Reduced from 3.0
-                
-                self.log.debug(f"Initial predictions:")
-                self.log.debug(f"24h: {price_24h}")
-                self.log.debug(f"48h: {price_48h}")
-                self.log.debug(f"3d: {price_3d}")
-                self.log.debug(f"7d: {price_7d}")
-                
-                # Adjust extreme predictions
-                max_7d_change = 1.5  # Reduced from 2.0 (150% maximum 7-day change)
-                if price_7d / current_price > max_7d_change:
-                    self.log.warning(f"Adjusting extreme prediction for {crypto_id}")
-                    adjustment_factor = max_7d_change / (price_7d / current_price)
-                    price_24h = current_price + (price_24h - current_price) * adjustment_factor
-                    price_48h = current_price + (price_48h - current_price) * adjustment_factor
-                    price_3d = current_price + (price_3d - current_price) * adjustment_factor
-                    price_7d = current_price * max_7d_change
-                    
-                    self.log.debug(f"Adjusted predictions:")
-                    self.log.debug(f"24h: {price_24h}")
-                    self.log.debug(f"48h: {price_48h}")
-                    self.log.debug(f"3d: {price_3d}")
-                    self.log.debug(f"7d: {price_7d}")
-
-                params = {
-                    'crypto_id': crypto_id,
-                    'prediction_date': datetime.now(),
-                    'prediction_created_at': datetime.now(),
-                    'price_24h': price_24h,
-                    'price_48h': price_48h,
-                    'price_3d': price_3d,
-                    'price_7d': price_7d,
-                    'confidence_score': float(confidence),
-                    'model_version': model_version,
-                    'batch_id': self.batch_id,
-                    'current_price': current_price
-                }
-                
                 insert_query = text("""
                     INSERT INTO coingecko_crypto_predictions (
                         crypto_id, prediction_date, prediction_created_at,
@@ -230,7 +214,7 @@ class CryptoPredictor:
                     )
                 """)
                 
-                connection.execute(insert_query, params)
+                connection.execute(insert_query, prediction_data)
                 connection.commit()
                 self.log.info(f"Successfully saved predictions for {crypto_id}")
                 
